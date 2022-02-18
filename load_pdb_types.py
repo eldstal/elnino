@@ -112,7 +112,8 @@ spec_width = {
   "80": 10,
 }
 
-# Returns type
+# This takes a basic typename on the microsoft format such as T_PUWCHAR80 and
+# generates a binja Type from it.
 def guess_builtin_type(arch, typename):
 
   #log.log(0, f"Basic type: {typename}")
@@ -168,11 +169,13 @@ def guess_builtin_type(arch, typename):
   builtin_types[typename] = ty
   return ty
 
-# Returns None if the type can't be resolved for some reason
-# Generates pointers, gets structures and enums from parsed_structs
-# Returns type,typeref,typename
+# Returns type,loose_typeref,firm_typeref,typename
+# A loose_typeref is an attempt at a reference to a future type,
+# which is not yet defined. a firm_typeref is definitely valid right now,
+# and already present in binja's type system.
+# Generates pointers, gets structures and enums from types["struct"] and types["enum"]
 # If the type doesn't need a typeref, the type info is returned twice.
-def resolve_type(arch, m, types):
+def resolve_type(bv, arch, m, types):
   if hasattr(m, "name"):
     typename = m.name
   else:
@@ -180,7 +183,7 @@ def resolve_type(arch, m, types):
 
   if not hasattr(m, "leaf_type"):
     t = guess_builtin_type(arch, m)
-    return t, t, str(m)
+    return t, t, t, str(m)
 
   known_leaves = [
                      "LF_ARRAY",
@@ -196,69 +199,90 @@ def resolve_type(arch, m, types):
                  ]
 
   if m.leaf_type not in known_leaves:
-    return Type.void(), Type.void(), "invalid_type"
+    return Type.void(), Type.void(), Type.void(), "invalid_type"
 
   if m.leaf_type == "LF_MEMBER":
     #return guess_builtin_type(arch, m.index.name), typename
-    return resolve_type(arch,m.index, types)
+    return resolve_type(bv, arch,m.index, types)
 
   elif m.leaf_type == "LF_STRUCTURE":
     typename = m.name
     t = None
-    if m.name in types["struct"]:
-      t = types["struct"][m.name]
+    ltr = None
+    ftr = None
+
     typeclass = NamedTypeReferenceClass["StructNamedTypeClass"]
-    ntr = Type.named_type_reference(type_class=typeclass, name=m.name)
-    return t, ntr, typename
+    ltr = Type.named_type_reference(type_class=typeclass, name=typename)
+
+    ## We need the member structure type to be completely defined already,
+    ## because you can't have a member struct of an unknown size.
+    if m.name in types["struct"] and m.name in bv.type_names:
+      t = types["struct"][m.name]
+      ftr = Type.named_type_from_registered_type(bv, typename)
+
+    # The caller may be OK with just a loose reference, for example to
+    # make a pointer to a struct that is unknown (or the self!)
+    # In that case, ftr is None but ltr is a named_type_reference
+    # which appears to be useless other than as a placeholder.
+    return t, ltr, ftr, typename
 
   elif m.leaf_type == "LF_ENUM":
     typename = m.name
     if m.name in types["enum"]:
       t = types["enum"][m.name]
       typeclass = NamedTypeReferenceClass["EnumNamedTypeClass"]
-      ntr = Type.named_type_reference(type_class=typeclass, name=m.name)
-      return t, ntr, typename
+      ltr = Type.named_type_reference(type_class=typeclass, name=m.name)
+      ftr = Type.named_type_from_registered_type(bv, name=m.name)
+      return t, ltr, ftr, typename
 
   elif m.leaf_type == "LF_UNION":
     typename = m.name
     t = None
+    ftr = None
     if m.name in types["struct"]:
       t = types["struct"][m.name]
+      ftr = Type.named_type_from_registered_type(bv, name=m.name)
+
     typeclass = NamedTypeReferenceClass["UnionNamedTypeClass"]
-    ntr = Type.named_type_reference(type_class=typeclass, name=m.name)
-    return t, ntr, typename
+    ltr = Type.named_type_reference(type_class=typeclass, name=m.name)
+    return t, ltr, ftr, typename
 
   elif m.leaf_type == "LF_POINTER":
-    target_type, typeref, ttypename = resolve_type(arch, m.utype, types)
-    if typeref is not None:
-      t = Type.pointer(arch, type = typeref)
-      return t, t, ttypename + "*"
+    target_type, ltyperef, ftyperef, ttypename = resolve_type(bv, arch, m.utype, types)
+
+    # It's OK for the target type to be undefined as of yet, because a pointer
+    # is certainly of known size.
+    if ltyperef is None:
+      ltyperef = Type.named_type_reference(type_class=NamedTypeReferenceClass["StructNamedTypeClass"], name=typename)
+
+    t = Type.pointer(arch, type = ltyperef)
+    return t, t, t, ttypename + "*"
 
   elif m.leaf_type == "LF_ARRAY":
     #log.log(0, str(dir(m.element_type)))
-    target_type,tref,ttypename = resolve_type(arch, m.element_type, types)
-    if target_type is not None:
-      #log.log(0, f"Array {m.name}: ")
-      #log.log(0, "  " + str(target_type))
-      #log.log(0, "  " + ttypename)
+    target_type,ltr,ftr,ttypename = resolve_type(bv, arch, m.element_type, types)
 
+    # Can't make an array unless we know for sure the size of the inner type
+    # The loose type reference isn't enough.
+    if ftr is not None:
       count = 0
       if target_type.width != 0:
         count = m.size // target_type.width
 
-      t = Type.array(tref, count)
-      return t, t, f"{ttypename}"
+      t = Type.array(ftr, count)
+      return t, t, t, f"{ttypename}"
 
   elif m.leaf_type == "LF_BITFIELD":
-    target_type, tref, ttypename = resolve_type(arch, m.base_type, types)
+    target_type, ltr, ftr, ttypename = resolve_type(bv, arch, m.base_type, types)
     if target_type is not None:
-      return target_type, tref, typename
+      return target_type, ltr, ftr, typename
 
   else:
     log.log(0, f"Unknown leaf type {m.leaf_type}")
-    return Type.void(), Type.void(), typename
+    return Type.void(), Type.void(), Type.void(), typename
 
-  return None, None, typename
+  # Can't resolve this type. Parse some more of the PDB and try again later.
+  return None, None, None, typename
 
 # Pass in a pdbparse object
 # Receive a Type.enum
@@ -274,7 +298,7 @@ def parse_enum(arch, e):
 
 # Returns None if the type is still incomplete,
 # i.e. members have types that aren't yet in parsed_structs
-def parse_struct(arch, s, types):
+def parse_struct(bv, arch, s, types, is_union=False):
   # We can only generate this type if all the subtypes are known
   missing_types = []
   members = []
@@ -283,12 +307,15 @@ def parse_struct(arch, s, types):
     if hasattr(m, "name"): name = m.name
 
     if hasattr(m, "offset"):
-      subtype,typeref, typename = resolve_type(arch, m, types)
-      if typeref is None:
+      subtype,ltr,ftr,typename = resolve_type(bv, arch, m, types)
+      # If that member's type couldn't be firmly determined, i.e.
+      # well enough to know its size, give up on it for now.
+      # This struct will be parsed again later.
+      if ftr is None:
         missing_types.append((typename, name))
       else:
         # Reference to a named type
-        t = typeref
+        t = ltr
 
         # Inline it as an anonymous struct
         if "__unnamed_" in typename:
@@ -303,40 +330,11 @@ def parse_struct(arch, s, types):
     log.log(0, f"Unable to parse struct {s.name}, missing {missing_types}")
     return None
 
-  return Type.structure(members=members)
+  if is_union:
+    return Type.union(members=members)
+  else:
+    return Type.structure(members=members)
 
-# Returns None if the type is still incomplete,
-# i.e. members have types that aren't yet in parsed_structs
-def parse_union(arch, s, types):
-  # We can only generate this type if all the subtypes are known
-  missing_types = []
-  members = []
-  for m in s.fieldlist.substructs:
-    name = "unnamed_substruct"
-    if hasattr(m, "name"): name = m.name
-
-    if hasattr(m, "offset"):
-      subtype,typeref, typename = resolve_type(arch, m, types)
-      if typeref is None:
-        missing_types.append(typename)
-      else:
-        # Reference to a named type
-        t = typeref
-
-        # Inline it as an anonymous struct
-        if "__unnamed_" in typename:
-          log.log(0, f"Inlining type {typename} inside {s.name}")
-          t = subtype
-
-        members.append(StructureMember(type=t,
-                                       name=name,
-                                       offset=m.offset))
-
-  if len(missing_types) != 0:
-    log.log(0, f"Unable to parse union {s.name}, missing {missing_types}")
-    return None
-
-  return Type.union(members=members)
 
 
 
@@ -345,6 +343,10 @@ def load_pdb(bv, path):
   types = { "struct": {}, "enum": {}, "union": {} }
 
   pdb = pp.parse(path)
+
+  if pdb is None:
+    log.log(2, f"Unable to open {path}.")
+    return None
 
 
   # TODO: Determine from PDB
@@ -377,8 +379,8 @@ def load_pdb(bv, path):
 
     # Create a named reference for others to use this structure as a member
     typeclass = NamedTypeReferenceClass["EnumNamedTypeClass"]
-    ntr = Type.named_type_reference(type_class=typeclass, name=e.name)
-    types["enum"][e.name] = ntr
+    ltr = Type.named_type_reference(type_class=typeclass, name=e.name)
+    types["enum"][e.name] = ltr
 
   n_parsed_structs = 0
   iteration_structs = -1
@@ -386,17 +388,18 @@ def load_pdb(bv, path):
     iteration_structs = 0
     remaining_structs = []
     for s in structs:
-      #if "nickle" not in s.name: continue
+      #if "unnamed_143b" not in s.name: continue
       p = None
       if s.leaf_type == "LF_STRUCTURE":
         log.log(0, f"Parsing struct {s.name}")
-        p = parse_struct(arch, s, types)
-        typeclass = NamedTypeReferenceClass["StructNamedTypeClass"]
+        #print(s)
+        p = parse_struct(bv, arch, s, types, is_union=False)
+        #typeclass = NamedTypeReferenceClass["StructNamedTypeClass"]
 
       elif s.leaf_type == "LF_UNION":
         log.log(0, f"Parsing union {s.name}")
-        p = parse_union(arch, s, types)
-        typeclass = NamedTypeReferenceClass["UnionNamedTypeClass"]
+        p = parse_struct(bv, arch, s, types, is_union=True)
+        #typeclass = NamedTypeReferenceClass["UnionNamedTypeClass"]
 
       if p is not None:
         iteration_structs += 1
@@ -418,19 +421,62 @@ def load_pdb(bv, path):
 
   log.log(1, f"{len(enums)} enums parsed from PDB.")
   if len(structs) > 0:
-    log.log(0, f"{len(structs)} not parsed due to incomplete info. This is probably a bug in the script.")
+    log.log(2, f"{len(structs)} not parsed due to incomplete info. This is probably a bug in the script.")
 
   return types
 
 
 def go(bv):
-  load_pdb(bv, r"C:\Symbols\ntdll.pdb\23E72AA7E3873AC79882BF6E394DA71E1\ntdll.pdb")
-  #load_pdb(bv, r"D:\Storage\Hax\experiments\symapp\symapp\Debug\symapp.pdb")
+  pdb_path = interaction.get_open_filename_input("Select PDB file to load types")
+  if pdb_path is not None:
+    load_pdb(bv, pdb_path)
+
+# Test code to figure out what can and cannot work in binja's type system
+# It turns out that named_type_reference will never be a good member of a struct,
+# because even once the target type is known the size of the member will not be updated.
+# Not sure what good it is.
+# The workaround for now is to register the types in the bv as soon as they are complete, and
+# get fully-fledged type references from the registered types instead.
+def attempt(bv):
+
+  STRUCT = NamedTypeReferenceClass["StructNamedTypeClass"]
+  bv.define_user_type("complete", Type.structure([ (Type.int(4), "num"), (Type.int(8), "quad") ]))
+
+  bv.define_user_type("uses_both",
+                              Type.structure([
+                                       StructureMember(offset=0x00, name="incomp", type=Type.named_type_reference(type_class=STRUCT, name="incomplete")),
+                                       #StructureMember(offset=0x40, name="comp",   type=Type.named_type_reference(type_class=STRUCT, name="complete")),
+                                       StructureMember(offset=0x40, name="comp",   type=Type.named_type_from_registered_type(bv, name="complete")),
+                              ])
+                     )
+
+  log.log(0, "the incomplete member is currently width=" + str(bv.get_type_by_name("uses_both").members[0].type.width))
+  log.log(0, "the complete member is currently width=" + str(bv.get_type_by_name("uses_both").members[1].type.width))
+  log.log(0, "the total struct is currently width=" + str(bv.get_type_by_name("uses_both").width))
+
+  bv.define_user_type("incomplete", Type.structure([ (Type.array(Type.char(), 64), "txt")]))
+
+
+  builder = StructureBuilder.create(type=StructureVariant["StructStructureType"])
+
+  # This works, but has no forward references. The `incomplete` type must have been registered previously.
+  builder.add_member_at_offset(offset=0x00, name="comp",  type=Type.named_type_from_registered_type(bv, name="complete"))
+  builder.add_member_at_offset(offset=0x10, name="incomp", type=Type.named_type_from_registered_type(bv, name="incomplete"))
+
+  #builder.add_member_at_offset(offset=0x00, name="comp",  type=Type.named_type_reference(type_class=STRUCT, name="complete"))
+  #builder.add_member_at_offset(offset=0x10, name="incomp", type=Type.named_type_reference(type_class=STRUCT, name="incomplete"))
+
+  #builder.add_member_at_offset(offset=0x00, name="comp",  type=bv.get_type_by_name("complete"))
+  #builder.add_member_at_offset(offset=0x10, name="incomp", type=bv.get_type_by_name("incomplete"))
+
+  bv.define_user_type("slow_built", builder.immutable_copy())
+
+  log.log(0, "the slow struct is currently width=" + str(bv.get_type_by_name("slow_built").width))
 
 def menu_click(view):
   types = go(view)
 
-  
+  #attempt(view)
 
 
 if __name__ == "__main__":
